@@ -23,9 +23,8 @@ import java.util.ArrayList;
 import java.util.Deque;
 import java.util.Iterator;
 import java.util.List;
-import java.util.concurrent.Executor;
-import java.util.concurrent.SynchronousQueue;
-import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import javax.annotation.Nullable;
 import okhttp3.internal.Util;
@@ -43,31 +42,26 @@ import static okhttp3.internal.Util.closeQuietly;
  */
 public final class ConnectionPool {
   /**
-   * Background threads are used to cleanup expired connections. There will be at most a single
-   * thread running per connection pool. The thread pool executor permits the pool itself to be
-   * garbage collected.
+   * Background threads are used to cleanup expired connections. There will be at most one task
+   * scheduled per connection pool. This executor permits the pool itself tobe garbage collected.
    */
-  private static final Executor executor = new ThreadPoolExecutor(0 /* corePoolSize */,
-      Integer.MAX_VALUE /* maximumPoolSize */, 60L /* keepAliveTime */, TimeUnit.SECONDS,
-      new SynchronousQueue<Runnable>(), Util.threadFactory("OkHttp ConnectionPool", true));
+  private static final ScheduledThreadPoolExecutor executor =
+      new ScheduledThreadPoolExecutor(1, Util.threadFactory("OkHttp ConnectionPool", true));
 
   /** The maximum number of idle connections for each address. */
   private final int maxIdleConnections;
   private final long keepAliveDurationNs;
   private final Runnable cleanupRunnable = new Runnable() {
     @Override public void run() {
-      while (true) {
-        long waitNanos = cleanup(System.nanoTime());
-        if (waitNanos == -1) return;
-        if (waitNanos > 0) {
-          long waitMillis = waitNanos / 1000000L;
-          waitNanos -= (waitMillis * 1000000L);
-          synchronized (ConnectionPool.this) {
-            try {
-              ConnectionPool.this.wait(waitMillis, (int) waitNanos);
-            } catch (InterruptedException ignored) {
-            }
-          }
+      long waitNanos;
+      while ((waitNanos = cleanup(System.nanoTime())) == 0);
+      synchronized (ConnectionPool.this) {
+        if (Thread.interrupted()) {
+          // If the task was interrupted(canceled), it will return without doing anything.
+        } else if (waitNanos > 0) {
+          cleanupFuture = executor.schedule(this, waitNanos, TimeUnit.NANOSECONDS);
+        } else {
+          cleanupFuture = null;
         }
       }
     }
@@ -76,6 +70,7 @@ public final class ConnectionPool {
   private final Deque<RealConnection> connections = new ArrayDeque<>();
   final RouteDatabase routeDatabase = new RouteDatabase();
   boolean cleanupRunning;
+  @Nullable ScheduledFuture<?> cleanupFuture;
 
   /**
    * Create a new connection pool with tuning parameters appropriate for a single-user application.
@@ -148,11 +143,11 @@ public final class ConnectionPool {
 
   void put(RealConnection connection) {
     assert (Thread.holdsLock(this));
+    connections.add(connection);
     if (!cleanupRunning) {
       cleanupRunning = true;
-      executor.execute(cleanupRunnable);
+      cleanupFuture = executor.schedule(cleanupRunnable, 0, TimeUnit.NANOSECONDS);
     }
-    connections.add(connection);
   }
 
   /**
@@ -161,13 +156,16 @@ public final class ConnectionPool {
    */
   boolean connectionBecameIdle(RealConnection connection) {
     assert (Thread.holdsLock(this));
-    if (connection.noNewStreams || maxIdleConnections == 0) {
-      connections.remove(connection);
-      return true;
-    } else {
-      notifyAll(); // Awake the cleanup thread: we may have exceeded the idle connection limit.
-      return false;
+    final boolean removed = connection.noNewStreams || maxIdleConnections == 0;
+    if (removed) connections.remove(connection);
+    if (cleanupRunning && (!removed || connections.isEmpty())) {
+      // Reschedule the cleanup task: we may have exceeded the idle connection limit.
+      if (cleanupFuture.cancel(true) && cleanupFuture instanceof Runnable) {
+        executor.remove((Runnable) cleanupFuture);
+      }
+      cleanupFuture = executor.schedule(cleanupRunnable, 0, TimeUnit.NANOSECONDS);
     }
+    return removed;
   }
 
   /** Close and remove all idle connections in the pool. */
@@ -181,6 +179,13 @@ public final class ConnectionPool {
           evictedConnections.add(connection);
           i.remove();
         }
+      }
+      if (cleanupRunning && connections.isEmpty()) {
+        // Reschedule the cleanup task: there may be no idle connection.
+        if (cleanupFuture.cancel(true) && cleanupFuture instanceof Runnable) {
+          executor.remove((Runnable) cleanupFuture);
+        }
+        cleanupFuture = executor.schedule(cleanupRunnable, 0, TimeUnit.NANOSECONDS);
       }
     }
 
